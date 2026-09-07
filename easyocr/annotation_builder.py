@@ -193,7 +193,7 @@ def identity(meta):
     # Device/runtime/code changes still invalidate it.
     return {k: v for k, v in meta.items()
             if k not in ("recognition_checkpoint_path", "detector_checkpoint_path",
-                         "input_root", "sample_range")}
+                         "input_root", "sample_range", "validation_samples")}
 
 
 def visualize(image_path, regions, destination):
@@ -213,7 +213,7 @@ def visualize(image_path, regions, destination):
     os.replace(temp, destination)
 
 
-def process_image(pipeline, path, input_dir, output_dir, batch_size):
+def process_image(pipeline, path, input_dir, output_dir, batch_size, run_validation=True):
     sid = sample_id(path, input_dir)
     artifact_dir = sample_output_dir(path, input_dir, output_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -229,7 +229,8 @@ def process_image(pipeline, path, input_dir, output_dir, batch_size):
     with torch.no_grad():
         for i, raw, input_size in pipeline.recognize_many(crops, batch_size):
             decoded = pipeline.decode(raw.logits)
-            checks[i] = validate_region(pipeline, crops[i], raw, decoded)
+            if run_validation:
+                checks[i] = validate_region(pipeline, crops[i], raw, decoded)
             polygon = np.asarray(boxes[i])
             regions[i] = dict(
                 region_id=i, bbox=boxes[i],
@@ -242,8 +243,8 @@ def process_image(pipeline, path, input_dir, output_dir, batch_size):
                 crop_size=list(crops[i].shape), recognizer_input_size=input_size)
             original["features"][i] = raw.feature[0].detach().cpu().clone()
             original["logits"][i] = raw.logits[0].detach().cpu().clone()
-    repeat = validate_repeat(pipeline, crops[0]) if crops else None
-    gradient = validate_input_gradient(pipeline, crops[0]) if crops else None
+    repeat = validate_repeat(pipeline, crops[0]) if run_validation and crops else None
+    gradient = validate_input_gradient(pipeline, crops[0]) if run_validation and crops else None
     relative_parent = path.relative_to(input_dir).parent.as_posix()
     record = dict(sample_id=sid, sample_position=sample_position(path),
                   image_path=input_dir.name + "/" + path.relative_to(input_dir).as_posix(),
@@ -258,20 +259,23 @@ def process_image(pipeline, path, input_dir, output_dir, batch_size):
     temp = target.with_name(target.name + ".tmp")
     torch.save(payload, temp)
     os.replace(temp, target)
-    cache, loaded = validate_cache(record, artifact_dir, original)
+    cache, loaded = (validate_cache(record, artifact_dir, original)
+                     if run_validation else (dict(passed=None, skipped=True), None))
     # Quantization can move a near-tied argmax. Preserve original-forward text,
     # and explicitly report whether decoding the stored fp16 logits changed it.
     cached_text_differences = []
-    for i, logits in enumerate(loaded["logits"]):
-        cached = pipeline.decode(logits.float().unsqueeze(0))
-        if cached.text != regions[i]["text"]:
-            cached_text_differences.append(dict(region_id=i, original=regions[i]["text"],
-                                                cached=cached.text,
-                                                reason="float16 logit rounding changed greedy argmax"))
+    if run_validation:
+        for i, logits in enumerate(loaded["logits"]):
+            cached = pipeline.decode(logits.float().unsqueeze(0))
+            if cached.text != regions[i]["text"]:
+                cached_text_differences.append(dict(region_id=i, original=regions[i]["text"],
+                                                    cached=cached.text,
+                                                    reason="float16 logit rounding changed greedy argmax"))
     visualize(path, regions, artifact_dir / record["visualization_path"])
     record["tensor_sha256"] = sha256_file(target)
     record["visualization_sha256"] = sha256_file(artifact_dir / record["visualization_path"])
-    record["validation"] = dict(regions=checks, deterministic=repeat, gradient=gradient,
+    record["validation"] = dict(mode="full" if run_validation else "skipped",
+                                regions=checks, deterministic=repeat, gradient=gradient,
                                 cache=cache, cached_text_differences=cached_text_differences)
     record["annotation_sha256"] = record_checksum(record)
     return record
@@ -285,12 +289,16 @@ def make_report(paths, records, failures, resumed, output_dir, low_threshold):
         return float(np.mean(values)) if values else None
     def extrema(values, fn):
         return fn(values) if values else None
-    checks = [c for r in records for c in r["validation"]["regions"]]
-    repeats = [r["validation"]["deterministic"] for r in records if r["validation"]["deterministic"] is not None]
-    gradients = [r["validation"]["gradient"] for r in records if r["validation"]["gradient"] is not None]
+    fully_validated = [r for r in records if r["validation"].get("mode", "full") == "full"]
+    skipped_validation = [r for r in records if r not in fully_validated]
+    checks = [c for r in fully_validated for c in r["validation"]["regions"]]
+    repeats = [r["validation"]["deterministic"] for r in fully_validated
+               if r["validation"]["deterministic"] is not None]
+    gradients = [r["validation"]["gradient"] for r in fully_validated
+                 if r["validation"]["gradient"] is not None]
     finite_counts = dict(feature_nan_count=0, feature_inf_count=0,
                          logits_nan_count=0, logits_inf_count=0)
-    for record in records:
+    for record in fully_validated:
         _, payload = validate_cache(record,
                                     Path(output_dir) / record["output_relative_dir"])
         for key, prefix in (("features", "feature"), ("logits", "logits")):
@@ -301,6 +309,7 @@ def make_report(paths, records, failures, resumed, output_dir, low_threshold):
         nonfinite_count_scope="Successfully saved caches; failed images are listed separately",
         discovered_hr_canonical_images=len(paths), processed_images=len(records),
         newly_processed_images=len(records)-resumed, resumed_images=resumed,
+        validated_images=len(fully_validated), validation_skipped_images=len(skipped_validation),
         failed_images=len(failures), failures=failures, total_regions=len(regions),
         avg_regions_per_image=mean(counts), min_regions_per_image=extrema(counts, min),
         max_regions_per_image=extrema(counts, max),
@@ -319,24 +328,30 @@ def make_report(paths, records, failures, resumed, output_dir, low_threshold):
         probability_test_passed=all(c["probability_passed"] for c in checks) if checks else None,
         shape_test_passed=all(c["shape_passed"] for c in checks) if checks else None,
         head_test_passed=all(c["head_passed"] for c in checks) if checks else None,
-        cached_tensor_test_passed=all(r["validation"]["cache"]["passed"] for r in records) if records else None,
+        cached_tensor_test_passed=(all(r["validation"]["cache"]["passed"] for r in fully_validated)
+                                   if fully_validated else None),
         old_new_differences=[dict(sample_id=r["sample_id"], region_id=i, **c)
-                             for r in records for i, c in enumerate(r["validation"]["regions"])
+                             for r in fully_validated for i, c in enumerate(r["validation"]["regions"])
                              if not c["old_new_passed"]],
-        cached_text_decode_warnings=[dict(sample_id=r["sample_id"], **d) for r in records
+        cached_text_decode_warnings=[dict(sample_id=r["sample_id"], **d) for r in fully_validated
                                      for d in r["validation"]["cached_text_differences"]],
         images=[dict(sample_id=r["sample_id"], sample_position=r["sample_position"],
                      image_path=r["image_path"], region_count=len(r["regions"]),
                      output_relative_dir=r["output_relative_dir"],
                      visualization_path=r["visualization_path"])
                 for r in records], **finite_counts)
+    full_validation_passed = bool(fully_validated and all(result[k] is True for k in (
+        "deterministic_test_passed", "gradient_test_passed", "old_new_test_passed",
+        "probability_test_passed", "shape_test_passed", "head_test_passed",
+        "cached_tensor_test_passed")))
     result["all_tests_passed"] = bool(paths and len(records) == len(paths) and not failures
-                                     and all(result[k] is True for k in (
-                                         "deterministic_test_passed", "gradient_test_passed",
-                                         "old_new_test_passed", "probability_test_passed",
-                                         "shape_test_passed", "head_test_passed",
-                                         "cached_tensor_test_passed")))
-    result["status"] = "passed" if result["all_tests_passed"] else "failed_or_not_fully_exercised"
+                                     and not skipped_validation and full_validation_passed)
+    if result["all_tests_passed"]:
+        result["status"] = "passed"
+    elif paths and len(records) == len(paths) and not failures:
+        result["status"] = "completed_with_partial_validation"
+    else:
+        result["status"] = "failed_or_not_fully_exercised"
     return result
 
 
@@ -442,14 +457,15 @@ def completed_record(path, input_dir, output_dir):
         if record["visualization_sha256"] != sha256_file(artifact_dir / record["visualization_path"]):
             return None
         validate_cache(record, artifact_dir)
-        checks = record["validation"]["regions"]
-        if (any(not all(c[k] for k in ("shape_passed", "probability_passed",
-                                       "head_passed", "old_new_passed"))
-                for c in checks)
-                or any(record["validation"][k] is not None
-                       and not record["validation"][k]["passed"]
-                       for k in ("deterministic", "gradient"))):
-            return None
+        validation = record["validation"]
+        if validation.get("mode", "full") == "full":
+            checks = validation["regions"]
+            if (any(not all(c[k] for k in ("shape_passed", "probability_passed",
+                                           "head_passed", "old_new_passed"))
+                    for c in checks)
+                    or any(validation[k] is not None and not validation[k]["passed"]
+                           for k in ("deterministic", "gradient"))):
+                return None
         return record
     except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError):
         return None
@@ -468,19 +484,25 @@ def write_sample_artifacts(path, record, input_dir, output_dir, low_confidence_t
 def build_mirrored_annotations(pipeline, input_dir="./dataset", output_dir="./ocr_annotations",
                                filename_filter="hr_canonical.png", batch_size=16,
                                resume=False, low_confidence_threshold=0.1,
-                               start_sample=None, end_sample=None):
+                               start_sample=None, end_sample=None,
+                               validation_samples=None):
     """Build resumable sample-local artifacts under a separate mirrored root."""
     input_dir, output_dir = Path(input_dir).resolve(), Path(output_dir).resolve()
     if output_dir == input_dir or output_dir.is_relative_to(input_dir):
         raise ValueError("Output must be outside the source dataset")
     discovered = discover_images(input_dir, filename_filter)
     paths, skipped = select_samples(discovered, start_sample, end_sample)
+    if validation_samples is not None and validation_samples < 0:
+        raise ValueError("validation_samples must be nonnegative or None")
+    validation_paths = set(paths if validation_samples is None
+                           else paths[:validation_samples])
     log("Discovered images: " + str(len(discovered))
         + "; selected samples: " + str(len(paths)))
     meta = teacher_metadata(pipeline, input_dir, filename_filter, batch_size)
     meta.update(schema_version=2, output_layout="mirrored_per_sample",
                 sample_range={"start": parse_sample_position(start_sample),
-                              "end": parse_sample_position(end_sample)})
+                              "end": parse_sample_position(end_sample)},
+                validation_samples=validation_samples)
     if output_dir.exists() and any(output_dir.iterdir()) and not resume:
         raise FileExistsError("Output is nonempty; use --resume or a new output directory")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -502,7 +524,8 @@ def build_mirrored_annotations(pipeline, input_dir="./dataset", output_dir="./oc
             record = completed_record(path, input_dir, output_dir) if resume else None
             resumed_this_sample = record is not None
             if record is None:
-                record = process_image(pipeline, path, input_dir, output_dir, batch_size)
+                record = process_image(pipeline, path, input_dir, output_dir, batch_size,
+                                       run_validation=path in validation_paths)
             else:
                 resumed_count += 1
             write_sample_artifacts(path, record, input_dir, output_dir,
@@ -510,6 +533,7 @@ def build_mirrored_annotations(pipeline, input_dir="./dataset", output_dir="./oc
             records.append(record)
             log("DONE | " + sid + " | regions=" + str(len(record["regions"]))
                 + (" | resumed=true" if resumed_this_sample else "")
+                + " | validation=" + record["validation"].get("mode", "full")
                 + " | elapsed_seconds={:.2f}".format(time.perf_counter() - started_at))
         except Exception as error:
             failures.append(dict(sample_id=sid, sample_position=sample_position(path),
@@ -522,6 +546,7 @@ def build_mirrored_annotations(pipeline, input_dir="./dataset", output_dir="./oc
     report.update(scope="selected_run", input_dir=str(input_dir),
                   output_dir=str(output_dir), start_sample=parse_sample_position(start_sample),
                   end_sample=parse_sample_position(end_sample),
+                  requested_validation_samples=validation_samples,
                   skipped_images=len(skipped), skipped=skipped)
     atomic_json(output_dir / "run_validation_report.json", report)
     log("RUN DONE | processed=" + str(report["processed_images"])
@@ -534,8 +559,8 @@ def build_mirrored_annotations(pipeline, input_dir="./dataset", output_dir="./oc
 def build_annotations(pipeline, input_dir="./dataset", output_dir="./ocr_annotations",
                       filename_filter="hr_canonical.png", batch_size=16,
                       resume=False, low_confidence_threshold=0.1,
-                      start_sample=None, end_sample=None):
+                      start_sample=None, end_sample=None, validation_samples=None):
     """Backward-compatible name for the mirrored per-sample builder."""
     return build_mirrored_annotations(
         pipeline, input_dir, output_dir, filename_filter, batch_size, resume,
-        low_confidence_threshold, start_sample, end_sample)
+        low_confidence_threshold, start_sample, end_sample, validation_samples)

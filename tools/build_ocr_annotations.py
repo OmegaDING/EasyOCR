@@ -33,6 +33,8 @@ def main():
                         help="Inclusive sample number, e.g. 1 or sample_000001")
     parser.add_argument("--end_sample",
                         help="Inclusive sample number, e.g. 100000 or sample_100000")
+    parser.add_argument("--validation_samples", type=int, default=None,
+                        help="Fully validate only the first N selected samples; 0 disables validation")
     parser.add_argument("--low_confidence_threshold", type=float, default=0.1)
     parser.add_argument("--text_threshold", type=float, default=0.7)
     parser.add_argument("--link_threshold", type=float, default=0.4)
@@ -41,8 +43,9 @@ def main():
     parser.add_argument("--mag_ratio", type=float, default=1.)
     parser.add_argument("--cpu_threads", type=int, default=4)
     args = parser.parse_args()
-    if args.batch_size < 1 or args.cpu_threads < 1:
-        parser.error("batch_size and cpu_threads must be positive")
+    if args.batch_size < 1 or args.cpu_threads < 1 or (
+            args.validation_samples is not None and args.validation_samples < 0):
+        parser.error("batch_size/cpu_threads must be positive; validation_samples must be nonnegative")
     if not 0 <= args.low_confidence_threshold <= 1:
         parser.error("low_confidence_threshold must be in [0,1]")
     root = Path(args.input_dir).resolve()
@@ -92,10 +95,10 @@ def main():
     report = build_mirrored_annotations(
         pipeline, args.input_dir, args.output_dir, args.filename_filter,
         args.batch_size, args.resume, args.low_confidence_threshold,
-        args.start_sample, args.end_sample)
+        args.start_sample, args.end_sample, args.validation_samples)
     log("CLI DONE | processed={processed_images} | failed={failed_images}"
         " | regions={total_regions} | status={status}".format(**report))
-    return 0 if report["all_tests_passed"] else 1
+    return 0 if report["status"] in ("passed", "completed_with_partial_validation") else 1
 
 
 if __name__ == "__main__":
