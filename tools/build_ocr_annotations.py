@@ -1,12 +1,18 @@
 #!/usr/bin/env python
 """Build phase-1 OCR annotations from this checkout, not an installed EasyOCR."""
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def log(message):
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+    print(stamp + " | " + message, flush=True)
 
 
 def main():
@@ -23,6 +29,10 @@ def main():
     parser.add_argument("--save_logits", action="store_true", default=True, help="Always enabled in phase 1")
     parser.add_argument("--visualize", action="store_true", default=True, help="Always enabled in phase 1")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--start_sample",
+                        help="Inclusive sample number, e.g. 1 or sample_000001")
+    parser.add_argument("--end_sample",
+                        help="Inclusive sample number, e.g. 100000 or sample_100000")
     parser.add_argument("--low_confidence_threshold", type=float, default=0.1)
     parser.add_argument("--text_threshold", type=float, default=0.7)
     parser.add_argument("--link_threshold", type=float, default=0.4)
@@ -45,10 +55,10 @@ def main():
             or any(c in args.filename_filter for c in "*?[]")):
         parser.error("filename_filter must be a literal basename")
     paths = sorted(p for p in root.rglob("*") if p.is_file() and p.name == args.filename_filter)
-    print("Selected " + str(len(paths)) + " files named exactly " + args.filename_filter, flush=True)
+    log("Selected " + str(len(paths)) + " files named exactly " + args.filename_filter)
     try:
         import torch
-        from easyocr.annotation_builder import build_annotations
+        from easyocr.annotation_builder import build_mirrored_annotations
         from easyocr.ocr_teacher import OCRPipeline
         torch.set_num_threads(args.cpu_threads)
         pipeline = OCRPipeline(
@@ -59,7 +69,7 @@ def main():
             low_text=args.low_text, canvas_size=args.canvas_size, mag_ratio=args.mag_ratio)
     except Exception as error:
         # Do not replace a completed run's report with an environment failure.
-        if not (output / "meta.json").exists() and not (output / "annotations.jsonl").exists():
+        if not (output / "meta.json").exists():
             output.mkdir(parents=True, exist_ok=True)
             report = dict(status="blocked_before_inference", all_tests_passed=None,
                           discovered_hr_canonical_images=len(paths), processed_images=0,
@@ -74,16 +84,17 @@ def main():
                         "deterministic_test_passed", "gradient_test_passed", "old_new_test_passed",
                         "probability_test_passed", "shape_test_passed", "cached_tensor_test_passed"):
                 report[key] = None
-            temp = output / "validation_report.json.tmp"
+            temp = output / "run_validation_report.json.tmp"
             temp.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            os.replace(temp, output / "validation_report.json")
+            os.replace(temp, output / "run_validation_report.json")
         print("Teacher initialization failed: " + str(error), file=sys.stderr)
         return 2
-    report = build_annotations(
+    report = build_mirrored_annotations(
         pipeline, args.input_dir, args.output_dir, args.filename_filter,
-        args.batch_size, args.resume, args.low_confidence_threshold)
-    print("Processed: {processed_images}; failed: {failed_images}; regions: {total_regions}; status: {status}".format(**report),
-          flush=True)
+        args.batch_size, args.resume, args.low_confidence_threshold,
+        args.start_sample, args.end_sample)
+    log("CLI DONE | processed={processed_images} | failed={failed_images}"
+        " | regions={total_regions} | status={status}".format(**report))
     return 0 if report["all_tests_passed"] else 1
 
 

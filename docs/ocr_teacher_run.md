@@ -92,3 +92,11 @@ Official weights download by default. For offline weights and the Python API,
 see `docs/ocr_teacher.md`. Successful execution will supply the missing
 per-image region counts, annotation examples, shapes and visualizations.
 
+## CUDA retry fix
+
+The first server run exposed a strict-determinism incompatibility in CUDA
+AdaptiveAvgPool2d backward during the required input-gradient check. The source
+now disables only `torch.use_deterministic_algorithms(True)`, while retaining
+eval mode, disabled TF32, deterministic cuDNN selection and repeated-forward
+allclose validation. Pull this revision, remove the failed output directory or
+use a new output directory, then rerun the command above.

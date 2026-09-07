@@ -43,8 +43,8 @@ required for this annotation interface. From the repository root:
 python -m pip install -r requirements.txt pytest
 python -m pytest tests/test_ocr_teacher.py -q
 python tools/build_ocr_annotations.py \
-  --input_dir ./dataset \
-  --output_dir ./ocr_annotations \
+  --input_dir ./dataset/prepared \
+  --output_dir ./ocr_annotations/prepared \
   --filename_filter hr_canonical.png \
   --languages ch_sim en \
   --gpu 0 --batch_size 16 \
@@ -137,9 +137,10 @@ separate, unmasked distribution for future distillation. There is no adaptive
 contrast, rotation selection, or confidence-based second pass in annotation.
 
 Confidence and text come from the same inference-dtype Z as F. Converting Z to
-float16 can change a nearly tied argmax; validation explicitly reports any
-difference when decoding the saved cache and fails acceptance in that case.
-It never silently relabels the original result.
+float16 can change a nearly tied argmax; validation explicitly reports such a
+cache-decode difference as a warning. It does not fail GT acceptance or silently
+relabel the original result, because the saved JSONL text is decoded from the
+same pre-cast forward logits as F and Z.
 
 ## Artifacts and validation
 
@@ -156,6 +157,13 @@ charset and hash, all preprocessing/decoder/detector settings, dimensions,
 runtime/device/dtypes and validation tolerances. `visualizations/*_bbox.png`
 shows boxes and region IDs on the full-resolution original.
 
+Strict `torch.use_deterministic_algorithms(True)` is deliberately disabled:
+CUDA does not implement a deterministic backward for EasyOCR's
+`AdaptiveAvgPool2d`. Enabling it prevents the required frozen-teacher input
+gradient test from running. Eval mode, disabled TF32, fixed cuDNN selection and
+the per-image repeated-forward allclose test remain enforced; the exact setting
+and reason are written to `meta.json`.
+
 `validation_report.json` contains input/success/failure counts, per-image
 region counts, confidence statistics, empty/low-confidence counts, tensor
 shape distributions, successful-cache NaN/Inf counts, old/new differences,
@@ -164,8 +172,10 @@ regions; their invalid tensors are not counted as successful caches.
 An all-empty dataset produces null (unexercised), not true, for forward tests.
 
 - Every region: F/Z dimensions, finite values, Z=Prediction(F), probability
-  normalization, and original `get_text` consistency with identical crop,
-  width and language mask, contrast_ths=0 and adjust_contrast=0.
+  normalization, exact original `get_text` text consistency with identical
+  crop, width and language mask, plus confidence within 5e-5 to account for
+  single-crop versus equal-width CUDA batch arithmetic; contrast_ths=0 and
+  adjust_contrast=0.
 - First region of every nonempty image: repeated forward allclose and frozen
   teacher/input-gradient backward.
 - Every saved region: safe tensor-only reload, matching IDs/indices/shapes,

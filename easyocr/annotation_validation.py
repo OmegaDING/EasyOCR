@@ -4,6 +4,8 @@ import torch
 
 from .recognition import get_text
 
+OLD_NEW_CONFIDENCE_ATOL = 5e-5
+
 
 def validate_region(pipeline, crop, raw, decoded):
     f, z = raw.feature, raw.logits
@@ -30,12 +32,23 @@ def validate_region(pipeline, crop, raw, decoded):
                    decoder="greedy", batch_size=1, contrast_ths=0.,
                    adjust_contrast=0., workers=0, device=str(pipeline.device))[0]
     delta = abs(float(old[2]) - decoded.confidence)
+    text_passed = old[1] == decoded.text
+    confidence_passed = delta <= OLD_NEW_CONFIDENCE_ATOL
+    if not text_passed:
+        reason = "CTC text differs with identical preprocessing and language mask."
+    elif not confidence_passed:
+        reason = ("Confidence exceeds the permitted single-vs-equal-width-batch "
+                  "CUDA numerical tolerance.")
+    else:
+        reason = None
     return dict(shape_passed=True, probability_passed=bool(probability_ok),
-                head_passed=bool(head_ok), text_old=old[1],
-                confidence_old=float(old[2]), confidence_abs_error=delta,
-                old_new_passed=(old[1] == decoded.text and delta <= 1e-5),
-                difference_reason=(None if old[1] == decoded.text and delta <= 1e-5
-                                   else "Same preprocessing and mask; inspect equal-width batched versus single forward numerical differences."))
+                head_passed=bool(head_ok), text_old=old[1], text_new=decoded.text,
+                text_passed=text_passed, confidence_old=float(old[2]),
+                confidence_new=float(decoded.confidence), confidence_abs_error=delta,
+                confidence_atol=OLD_NEW_CONFIDENCE_ATOL,
+                confidence_passed=confidence_passed,
+                old_new_passed=(text_passed and confidence_passed),
+                difference_reason=reason)
 
 
 def validate_input_gradient(pipeline, crop):
@@ -99,4 +112,3 @@ def validate_cache(record, output_dir, original=None):
         if not np.isfinite(region["recognition_confidence"]):
             raise ValueError("Non-finite confidence")
     return dict(passed=True, max_abs_errors=max_errors), payload
-

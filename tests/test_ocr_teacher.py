@@ -82,6 +82,8 @@ def test_preprocessing_original_consistency_and_repeat(pipeline):
         decoded = pipeline.decode(raw.logits)
         checks = validate_region(pipeline, crop, raw, decoded)
     assert all(checks[k] for k in ("shape_passed", "head_passed", "probability_passed", "old_new_passed"))
+    assert checks["text_old"] == checks["text_new"]
+    assert checks["confidence_passed"]
     assert validate_repeat(pipeline, crop)["passed"]
     assert validate_input_gradient(pipeline, crop)["passed"]
 
@@ -121,48 +123,70 @@ def test_filename_filter_and_ids(tmp_path):
                    for p in paths]
 
 
-def test_builder_cache_resume_corruption_and_empty_image(tmp_path, pipeline, monkeypatch):
+def test_mirrored_builder_range_resume_corruption_and_empty_image(tmp_path, pipeline, monkeypatch):
     dataset, output = tmp_path / "dataset", tmp_path / "annotations"
-    (dataset / "a").mkdir(parents=True)
-    (dataset / "b").mkdir()
+    (dataset / "prepared" / "sample_000001").mkdir(parents=True)
+    (dataset / "prepared" / "sample_000002").mkdir()
+    (dataset / "prepared" / "other").mkdir()
     img = np.random.default_rng(7).integers(0, 255, (64, 192), dtype=np.uint8)
-    Image.fromarray(img).save(dataset / "a" / "hr_canonical.png")
-    Image.fromarray(img).save(dataset / "b" / "hr_canonical.png")
-    Image.fromarray(img).save(dataset / "a" / "lr.png")
+    Image.fromarray(img).save(dataset / "prepared" / "sample_000001" / "hr_canonical.png")
+    Image.fromarray(img).save(dataset / "prepared" / "sample_000002" / "hr_canonical.png")
+    Image.fromarray(img).save(dataset / "prepared" / "other" / "hr_canonical.png")
+    Image.fromarray(img).save(dataset / "prepared" / "sample_000001" / "lr.png")
     calls = []
     def detect(path):
         calls.append(path)
-        return [] if path.parent.name == "b" else [[[1, 1], [90, 1], [90, 31], [1, 31]],
-                                                   [[95, 5], [180, 5], [180, 40], [95, 40]]]
+        return [] if path.parent.name == "sample_000002" else [
+            [[1, 1], [90, 1], [90, 31], [1, 31]],
+            [[95, 5], [180, 5], [180, 40], [95, 40]]]
     pipeline.detect = detect
     monkeypatch.setattr(builder, "teacher_metadata", lambda *args: {"test_teacher": 1})
-    report = builder.build_annotations(pipeline, dataset, output, batch_size=2)
+    report = builder.build_mirrored_annotations(
+        pipeline, dataset / "prepared", output / "prepared", batch_size=2,
+        start_sample=1, end_sample=1)
     assert report["all_tests_passed"]
-    assert report["processed_images"] == 2 and report["total_regions"] == 2
-    records = [json.loads(line) for line in (output / "annotations.jsonl").read_text().splitlines()]
-    assert [len(r["regions"]) for r in records] == [2, 0]
+    assert report["processed_images"] == 1 and report["total_regions"] == 2
+    sample_one = output / "prepared" / "sample_000001"
+    assert (sample_one / "tensor.pt").is_file()
+    assert (sample_one / "annotations.json").is_file()
+    assert (sample_one / "annotation_validation_report.json").is_file()
+    assert not (dataset / "prepared" / "sample_000001" / "tensor.pt").exists()
     with pytest.raises(FileExistsError):
-        builder.build_annotations(pipeline, dataset, output)
+        builder.build_mirrored_annotations(pipeline, dataset / "prepared", output / "prepared")
     calls.clear()
-    resumed = builder.build_annotations(pipeline, dataset, output, batch_size=2, resume=True)
-    assert resumed["resumed_images"] == 2 and not calls
-    target = output / records[0]["tensor_path"]
+    resumed = builder.build_mirrored_annotations(
+        pipeline, dataset / "prepared", output / "prepared", batch_size=2,
+        resume=True, start_sample="sample_000001", end_sample="000001")
+    assert resumed["resumed_images"] == 1 and not calls
+    target = sample_one / "tensor.pt"
     payload = torch.load(target, weights_only=True)
     payload["features"][0][0, 0] += 1
     torch.save(payload, target)
-    resumed = builder.build_annotations(pipeline, dataset, output, batch_size=2, resume=True)
-    assert resumed["resumed_images"] == 1 and len(calls) == 1
+    resumed = builder.build_mirrored_annotations(
+        pipeline, dataset / "prepared", output / "prepared", batch_size=2,
+        resume=True, start_sample=1, end_sample=1)
+    assert resumed["resumed_images"] == 0 and len(calls) == 1
     assert resumed["all_tests_passed"]
     calls.clear()
-    records = [json.loads(line) for line in (output / "annotations.jsonl").read_text().splitlines()]
-    records[0]["regions"][0]["text"] = "corrupted annotation"
-    builder.write_jsonl(output / "annotations.jsonl", records)
-    repaired = builder.build_annotations(pipeline, dataset, output, batch_size=2, resume=True)
-    assert repaired["resumed_images"] == 1 and len(calls) == 1
+    record_path = sample_one / "annotations.json"
+    record = json.loads(record_path.read_text())
+    record["regions"][0]["text"] = "corrupted annotation"
+    builder.atomic_json(record_path, record)
+    repaired = builder.build_mirrored_annotations(
+        pipeline, dataset / "prepared", output / "prepared", batch_size=2,
+        resume=True, start_sample=1, end_sample=1)
+    assert repaired["resumed_images"] == 0 and len(calls) == 1
     assert repaired["all_tests_passed"]
+    calls.clear()
+    second = builder.build_mirrored_annotations(
+        pipeline, dataset / "prepared", output / "prepared", batch_size=2,
+        resume=True, start_sample=2, end_sample=2)
+    assert second["processed_images"] == 1 and second["resumed_images"] == 0
+    assert len(calls) == 1
     monkeypatch.setattr(builder, "teacher_metadata", lambda *args: {"test_teacher": 2})
     with pytest.raises(ValueError, match="identity"):
-        builder.build_annotations(pipeline, dataset, output, resume=True)
+        builder.build_mirrored_annotations(pipeline, dataset / "prepared",
+                                           output / "prepared", resume=True)
 
 
 def test_all_empty_is_not_a_false_validation_pass(tmp_path, pipeline, monkeypatch):

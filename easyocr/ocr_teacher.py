@@ -35,9 +35,18 @@ class OCRDecodedOutput:
 
 
 def configure_determinism():
+    """Configure repeatable inference without forbidding valid CUDA backward.
+
+    EasyOCR's AdaptiveAvgPool2d CUDA backward has no deterministic-algorithm
+    implementation. Enabling torch.use_deterministic_algorithms(True) makes
+    the required frozen-teacher input-gradient acceptance test fail before it
+    can verify gradients. Eval mode, fixed cuDNN selection and disabled TF32
+    still make annotation forwards repeatable; validate_repeat() is the
+    executable guarantee for the actual loaded teacher/runtime.
+    """
     # Must be set before initializing CUDA.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(False)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = False
