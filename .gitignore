@@ -107,3 +107,8 @@ ENV/
 .vscode/
 .vs/
 .idea/
+
+# Local OCR annotation runtime, downloaded weights and generated artifacts
+.ocr_runtime/
+.ocr_models/
+ocr_annotations/

@@ -86,7 +86,7 @@ class Reader(object):
 
         # check and download detection model
         self.support_detection_network = ['craft', 'dbnet18']
-        self.quantize=quantize, 
+        self.quantize=quantize
         self.cudnn_benchmark=cudnn_benchmark
         if detector:
             detector_path = self.getDetectorPath(detect_network)
@@ -228,6 +228,8 @@ class Reader(object):
                     }
             else:
                 network_params = recog_config['network_params']
+            self.recog_network = recog_network
+            self.recognition_checkpoint = model_path
             self.recognizer, self.converter = get_recognizer(recog_network, network_params,\
                                                          self.character, separator_list,\
                                                          dict_list, model_path, device = self.device, quantize=quantize)

@@ -1,0 +1,1285 @@
+diff --git a/.gitignore b/.gitignore
+index 683938b..b3c66cf 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -107,3 +107,8 @@ ENV/
+ .vscode/
+ .vs/
+ .idea/
++
++# Local OCR annotation runtime, downloaded weights and generated artifacts
++.ocr_runtime/
++.ocr_models/
++ocr_annotations/
+diff --git a/easyocr/easyocr.py b/easyocr/easyocr.py
+index c08fe03..4770a80 100644
+--- a/easyocr/easyocr.py
++++ b/easyocr/easyocr.py
+@@ -86,7 +86,7 @@ class Reader(object):
+ 
+         # check and download detection model
+         self.support_detection_network = ['craft', 'dbnet18']
+-        self.quantize=quantize, 
++        self.quantize=quantize
+         self.cudnn_benchmark=cudnn_benchmark
+         if detector:
+             detector_path = self.getDetectorPath(detect_network)
+@@ -228,6 +228,8 @@ class Reader(object):
+                     }
+             else:
+                 network_params = recog_config['network_params']
++            self.recog_network = recog_network
++            self.recognition_checkpoint = model_path
+             self.recognizer, self.converter = get_recognizer(recog_network, network_params,\
+                                                          self.character, separator_list,\
+                                                          dict_list, model_path, device = self.device, quantize=quantize)
+diff --git a/easyocr/model/model.py b/easyocr/model/model.py
+index ed3f3fb..20f4908 100644
+--- a/easyocr/model/model.py
++++ b/easyocr/model/model.py
+@@ -20,7 +20,7 @@ class Model(nn.Module):
+         self.Prediction = nn.Linear(self.SequenceModeling_output, num_class)
+ 
+ 
+-    def forward(self, input, text):
++    def encode(self, input):
+         """ Feature extraction stage """
+         visual_feature = self.FeatureExtraction(input)
+         visual_feature = self.AdaptiveAvgPool(visual_feature.permute(0, 3, 1, 2))  # [b, c, h, w] -> [b, w, c, h]
+@@ -29,7 +29,12 @@ class Model(nn.Module):
+         """ Sequence modeling stage """
+         contextual_feature = self.SequenceModeling(visual_feature)
+ 
+-        """ Prediction stage """
++        return contextual_feature
++
++    def forward(self, input, text=None, return_features=False):
++        contextual_feature = self.encode(input)
+         prediction = self.Prediction(contextual_feature.contiguous())
+ 
++        if return_features:
++            return contextual_feature, prediction
+         return prediction
+diff --git a/easyocr/model/vgg_model.py b/easyocr/model/vgg_model.py
+index b0f2ae1..09b1b83 100644
+--- a/easyocr/model/vgg_model.py
++++ b/easyocr/model/vgg_model.py
+@@ -20,7 +20,7 @@ class Model(nn.Module):
+         self.Prediction = nn.Linear(self.SequenceModeling_output, num_class)
+ 
+ 
+-    def forward(self, input, text):
++    def encode(self, input):
+         """ Feature extraction stage """
+         visual_feature = self.FeatureExtraction(input)
+         visual_feature = self.AdaptiveAvgPool(visual_feature.permute(0, 3, 1, 2))
+@@ -29,7 +29,12 @@ class Model(nn.Module):
+         """ Sequence modeling stage """
+         contextual_feature = self.SequenceModeling(visual_feature)
+ 
+-        """ Prediction stage """
++        return contextual_feature
++
++    def forward(self, input, text=None, return_features=False):
++        contextual_feature = self.encode(input)
+         prediction = self.Prediction(contextual_feature.contiguous())
+ 
++        if return_features:
++            return contextual_feature, prediction
+         return prediction
+diff --git a/easyocr/ocr_teacher.py b/easyocr/ocr_teacher.py
+new file mode 100644
+index 0000000..3afffe2
+--- /dev/null
++++ b/easyocr/ocr_teacher.py
+@@ -0,0 +1,255 @@
++"""Composable OCR teacher. NumPy images use EasyOCR's BGR convention.
++
++F is the actual final SequenceModeling output (including the projection inside
++EasyOCR's BidirectionalLSTM), not the unprojected recurrent state. Z is raw
++Prediction(F), before language masking or softmax.
++"""
++from dataclasses import dataclass
++import math
++import os
++from pathlib import Path
++
++import cv2
++import numpy as np
++from PIL import Image
++import torch
++from torch import nn
++
++from .config import imgH
++from .detection import test_net
++from .easyocr import Reader
++from .recognition import AlignCollate, custom_mean
++from .utils import compute_ratio_and_resize, four_point_transform, reformat_input
++
++
++@dataclass
++class OCRForwardOutput:
++    feature: torch.Tensor  # [B, T, D], attached to input autograd graph
++    logits: torch.Tensor  # [B, T, C], including blank at index zero
++
++
++@dataclass
++class OCRDecodedOutput:
++    text: str
++    confidence: float
++
++
++def configure_determinism():
++    # Must be set before initializing CUDA.
++    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
++    torch.use_deterministic_algorithms(True)
++    torch.backends.cudnn.benchmark = False
++    torch.backends.cudnn.deterministic = True
++    torch.backends.cuda.matmul.allow_tf32 = False
++    torch.backends.cudnn.allow_tf32 = False
++
++
++class RecognitionEncoder(nn.Module):
++    def __init__(self, model):
++        super().__init__()
++        self.model = model
++
++    def forward(self, image):
++        return self.model.encode(image)
++
++
++class CharacterPredictionHead(nn.Module):
++    def __init__(self, prediction):
++        super().__init__()
++        self.linear = prediction
++
++    def forward(self, feature):
++        return self.linear(feature.contiguous())
++
++
++class OCRRecognizer(nn.Module):
++    """Frozen differentiable teacher for normalized [B, 1, H, W] tensors.
++
++    Preprocessing NumPy/PIL crops is intentionally separate. This forward never
++    calls no_grad(), inference_mode(), detach(), or a decoder.
++    """
++    def __init__(self, model):
++        super().__init__()
++        if isinstance(model, nn.DataParallel):
++            model = model.module
++        if not hasattr(model, "encode") or not isinstance(model.Prediction, nn.Linear):
++            raise TypeError("A non-quantized built-in generation1/2 model is required")
++        self.encoder = RecognitionEncoder(model)
++        self.head = CharacterPredictionHead(model.Prediction)
++        self.feature_dim = model.Prediction.in_features
++        self.num_classes = model.Prediction.out_features
++        self.requires_grad_(False)
++        self.eval()
++
++    def forward(self, image):
++        if image.ndim != 4 or image.shape[1] != 1:
++            raise ValueError("Expected normalized [B, 1, H, W] image tensor")
++        # cuDNN RNN backward is unavailable after an eval-mode cuDNN forward.
++        # Native LSTM preserves eval semantics and input gradients on CUDA.
++        if image.is_cuda and torch.is_grad_enabled() and image.requires_grad:
++            with torch.backends.cudnn.flags(enabled=False):
++                feature = self.encoder(image)
++        else:
++            feature = self.encoder(image)
++        return OCRForwardOutput(feature, self.head(feature))
++
++
++class CTCDecoder:
++    """Greedy CTC with the original EasyOCR language mask and custom_mean."""
++    def __init__(self, converter, ignore_indices):
++        self.converter = converter
++        self.ignore_indices = list(ignore_indices)
++
++    def __call__(self, logits):
++        if logits.ndim != 3 or logits.shape[-1] != len(self.converter.character):
++            raise ValueError("Expected [B, T, C] raw logits matching the charset")
++        # Match recognizer_predict's softmax -> NumPy mask -> renormalize path.
++        probs = logits.detach().float().softmax(-1).cpu().numpy()
++        probs[:, :, self.ignore_indices] = 0.
++        probs = probs / probs.sum(axis=2, keepdims=True)
++        indices = probs.argmax(2)
++        lengths = torch.IntTensor([logits.shape[1]] * logits.shape[0])
++        texts = self.converter.decode_greedy(indices.reshape(-1), lengths)
++        values = probs.max(2)
++        outputs = []
++        for text, value, index in zip(texts, values, indices):
++            nonblank = value[index != 0]
++            if not len(nonblank):
++                nonblank = np.array([0])
++            outputs.append(OCRDecodedOutput(text, float(custom_mean(nonblank))))
++        return outputs
++
++
++class TextDetector:
++    """CRAFT's original quadrilaterals in image pixels, without line merging."""
++    def __init__(self, reader, **thresholds):
++        self.reader = reader
++        self.config = dict(canvas_size=2560, mag_ratio=1.,
++                           text_threshold=0.7, link_threshold=0.4, low_text=0.4)
++        unknown = set(thresholds) - set(self.config)
++        if unknown:
++            raise ValueError("Unknown CRAFT options: " + str(sorted(unknown)))
++        self.config.update(thresholds)
++
++    def __call__(self, image):
++        color, _ = reformat_input(str(image) if isinstance(image, Path) else image)
++        boxes, _ = test_net(net=self.reader.detector, image=color, poly=False,
++                            device=self.reader.device, **self.config)
++        polygons = [np.asarray(box, dtype=np.float32).reshape(4, 2)
++                    for box in boxes[0]]
++        # Stable region IDs; preserve CRAFT's point order and floating coordinates.
++        polygons.sort(key=lambda p: (float(p[:, 1].min()), float(p[:, 0].min()),
++                                     tuple(p.reshape(-1))))
++        return [p.tolist() for p in polygons]
++
++
++class OCRPipeline:
++    def __init__(self, languages=None, gpu=True, model_storage_directory=None,
++                 download_enabled=True, **detector_thresholds):
++        languages = list(languages or ["ch_sim", "en"])
++        if languages != ["ch_sim", "en"]:
++            raise ValueError("Phase 1 teacher requires languages=['ch_sim', 'en']")
++        configure_determinism()
++        if gpu is False or str(gpu).lower() == "cpu":
++            device = "cpu"
++        elif torch.cuda.is_available():
++            device = "cuda" if gpu is True else str(gpu)
++            if device.isdigit():
++                device = "cuda:" + device
++        else:
++            device = "cpu"
++        self.languages = languages
++        self.reader = Reader(languages, gpu=device, detect_network="craft",
++                             quantize=False, cudnn_benchmark=False,
++                             model_storage_directory=model_storage_directory,
++                             user_network_directory=(str(Path(model_storage_directory) / "user_network")
++                                                     if model_storage_directory else None),
++                             download_enabled=download_enabled)
++        if isinstance(self.reader.detector, nn.DataParallel):
++            self.reader.detector = self.reader.detector.module
++        self.reader.detector.eval().requires_grad_(False)
++        self.recognizer = OCRRecognizer(self.reader.recognizer)
++        # Single-device teacher; avoid DataParallel's implicit cuda:0 device IDs.
++        self.reader.recognizer = self.recognizer.encoder.model
++        self.detector = TextDetector(self.reader, **detector_thresholds)
++        ignore = [i + 1 for i, c in enumerate(self.reader.character)
++                  if c not in set(self.reader.lang_char)]
++        self.decoder = CTCDecoder(self.reader.converter, ignore)
++        self.imgH = imgH
++
++    @property
++    def device(self):
++        return next(self.recognizer.parameters()).device
++
++    def detect(self, image):
++        return self.detector(image)
++
++    def crop(self, image, box):
++        _, gray = reformat_input(str(image) if isinstance(image, Path) else image)
++        polygon = np.asarray(box, dtype=np.float32)
++        if polygon.shape != (4, 2) or not np.isfinite(polygon).all():
++            raise ValueError("bbox must be a finite [4, 2] polygon")
++        if not cv2.isContourConvex(polygon) or abs(cv2.contourArea(polygon)) < 1:
++            raise ValueError("Degenerate/non-convex CRAFT polygon")
++        crop = four_point_transform(gray, polygon)
++        if crop.size == 0:
++            raise ValueError("Empty rectified crop")
++        return crop
++
++    def prepare_crop(self, crop):
++        """Match get_image_list's free-polygon path after four_point_transform.
++
++        Width is derived ONLY from this crop, never other batch members.
++        The intermediate OpenCV resize is retained for original-path parity.
++        """
++        if crop.ndim != 2 or crop.dtype != np.uint8 or not crop.size:
++            raise ValueError("Expected a nonempty uint8 grayscale crop")
++        height, width = crop.shape
++        resized, ratio = compute_ratio_and_resize(crop, width, height, self.imgH)
++        padded_width = math.ceil(max(1., ratio)) * self.imgH
++        return resized, padded_width
++
++    def preprocess(self, crop):
++        resized, width = self.prepare_crop(crop)
++        tensor = AlignCollate(imgH=self.imgH, imgW=width,
++                              keep_ratio_with_pad=True, adjust_contrast=0.)(
++                                  [Image.fromarray(resized)])
++        return tensor.to(device=self.device,
++                         dtype=next(self.recognizer.parameters()).dtype)
++
++    def recognize_raw(self, crop):
++        return self.recognizer(self.preprocess(crop))
++
++    def recognize_many(self, crops, batch_size=16):
++        """Yield (original_index, raw, input_size) using equal-width buckets.
++
++        No cross-width padding; therefore region T and supervision do not depend
++        on batch composition. Results carry original indices for safe assembly.
++        Call under torch.no_grad() for offline annotation.
++        """
++        if batch_size < 1:
++            raise ValueError("batch_size must be positive")
++        buckets = {}
++        for index, crop in enumerate(crops):
++            resized, width = self.prepare_crop(crop)
++            buckets.setdefault(width, []).append((index, resized))
++        for width, items in sorted(buckets.items()):
++            collate = AlignCollate(imgH=self.imgH, imgW=width,
++                                   keep_ratio_with_pad=True, adjust_contrast=0.)
++            for offset in range(0, len(items), batch_size):
++                chunk = items[offset:offset + batch_size]
++                tensor = collate([Image.fromarray(img) for _, img in chunk]).to(
++                    device=self.device, dtype=next(self.recognizer.parameters()).dtype)
++                raw = self.recognizer(tensor)
++                for row, (index, _) in enumerate(chunk):
++                    yield index, OCRForwardOutput(raw.feature[row:row+1],
++                                                  raw.logits[row:row+1]), [self.imgH, width]
++
++    def decode_batch(self, logits):
++        return self.decoder(logits)
++
++    def decode(self, logits):
++        outputs = self.decode_batch(logits)
++        if len(outputs) != 1:
++            raise ValueError("Use decode_batch for B != 1")
++        return outputs[0]
+diff --git a/easyocr/annotation_builder.py b/easyocr/annotation_builder.py
+new file mode 100644
+index 0000000..bd13fef
+--- /dev/null
++++ b/easyocr/annotation_builder.py
+@@ -0,0 +1,356 @@
++"""Offline per-image annotations, resumable caches and acceptance reports."""
++from collections import Counter
++import hashlib
++from importlib.metadata import PackageNotFoundError, version
++import json
++import os
++from pathlib import Path
++import re
++import subprocess
++
++import numpy as np
++from PIL import Image, ImageDraw
++import torch
++
++from . import __version__
++from .annotation_validation import (validate_cache, validate_input_gradient,
++                                    validate_region, validate_repeat)
++from .config import detection_models
++from .utils import reformat_input
++
++
++def sha256_file(path):
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for block in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def discover_images(input_dir, filename="hr_canonical.png"):
++    root = Path(input_dir).resolve()
++    if not root.is_dir():
++        raise FileNotFoundError("Input directory not found: " + str(root))
++    if Path(filename).name != filename or any(c in filename for c in "*?[]"):
++        raise ValueError("filename_filter must be a literal basename")
++    # Explicit equality also enforces case sensitivity on Windows.
++    paths = sorted((p for p in root.rglob("*")
++                    if p.is_file() and p.name == filename),
++                   key=lambda p: p.relative_to(root).as_posix())
++    for path in paths:
++        if not path.resolve().is_relative_to(root):
++            raise ValueError("Input symlink escapes dataset: " + str(path))
++    return paths
++
++
++def sample_id(path, input_dir):
++    parent = Path(path).relative_to(input_dir).parent.as_posix()
++    readable = re.sub(r"[^a-zA-Z0-9_.-]", "_", parent.replace("/", "__"))
++    readable = readable.strip(".") or "root"
++    return readable[:100] + "--" + hashlib.sha256(parent.encode("utf-8")).hexdigest()[:12]
++
++
++def atomic_json(path, value):
++    path = Path(path)
++    temp = path.with_name(path.name + ".tmp")
++    with temp.open("w", encoding="utf-8", newline="\n") as stream:
++        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
++        stream.write("\n")
++    os.replace(temp, path)
++
++
++def write_jsonl(path, records):
++    temp = path.with_name(path.name + ".tmp")
++    with temp.open("w", encoding="utf-8", newline="\n") as stream:
++        for record in records:
++            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
++    os.replace(temp, path)
++
++
++def record_checksum(record):
++    data = {k: v for k, v in record.items() if k != "annotation_sha256"}
++    return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True,
++                                     allow_nan=False).encode("utf-8")).hexdigest()
++
++
++def teacher_metadata(pipeline, input_dir, filename, batch_size):
++    package = Path(__file__).resolve().parent
++    try:
++        commit = subprocess.check_output(["git", "rev-parse", "HEAD"],
++                                         cwd=package.parent, text=True,
++                                         stderr=subprocess.DEVNULL).strip()
++    except (OSError, subprocess.CalledProcessError):
++        commit = None
++    reader = pipeline.reader
++    checkpoint = Path(reader.recognition_checkpoint)
++    detector_checkpoint = Path(reader.model_storage_directory) / detection_models["craft"]["filename"]
++    charset = reader.converter.character
++    libraries = {}
++    for name in ("torch", "torchvision", "numpy", "Pillow", "opencv-python-headless",
++                 "opencv-python", "scipy", "scikit-image"):
++        try:
++            libraries[name] = version(name)
++        except PackageNotFoundError:
++            libraries[name] = None
++    code_files = ["ocr_teacher.py", "annotation_builder.py", "annotation_validation.py",
++                  "recognition.py", "easyocr.py", "utils.py", "config.py",
++                  "detection.py", "craft.py", "craft_utils.py", "imgproc.py",
++                  "model/model.py", "model/vgg_model.py", "model/modules.py"]
++    return dict(
++        schema_version=1, easyocr_version=__version__, git_commit=commit,
++        library_versions=libraries,
++        source_sha256={p: sha256_file(package / p) for p in code_files},
++        languages=pipeline.languages, detector_model="craft",
++        recognition_model=checkpoint.stem, generation=reader.recog_network,
++        recognition_checkpoint_path=str(checkpoint.resolve()),
++        recognition_checkpoint_sha256=sha256_file(checkpoint),
++        detector_checkpoint_path=str(detector_checkpoint.resolve()),
++        detector_checkpoint_sha256=sha256_file(detector_checkpoint),
++        character_set=charset,
++        charset_sha256=hashlib.sha256(json.dumps(charset, ensure_ascii=False).encode("utf-8")).hexdigest(),
++        blank_index=0, ignore_indices=pipeline.decoder.ignore_indices,
++        feature_dim=pipeline.recognizer.feature_dim, num_classes=pipeline.recognizer.num_classes,
++        feature_semantics="Final SequenceModeling output, including BidirectionalLSTM projections",
++        logits_semantics="Raw Prediction(F); unmasked, pre-softmax, includes blank",
++        imgH=pipeline.imgH, imgW="ceil(max(w/h,h/w,1))*imgH per rectified crop",
++        keep_ratio_with_pad=True, decoder="greedy", contrast_ths=0., adjust_contrast=0.,
++        deterministic_mode=True, deterministic_algorithms=True,
++        cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
++        cudnn_benchmark=False, quantize=False, tf32=False,
++        detector_thresholds=pipeline.detector.config,
++        bbox_format="CRAFT quadrilateral [TL,TR,BR,BL] in original pixels; no grouping or margin",
++        crop_policy="utils.four_point_transform; OpenCV linear warp, zero border",
++        preprocessing="compute_ratio_and_resize then AlignCollate PIL bicubic, [-1,1], right edge pad",
++        gradient_input_contract="normalized [B,1,imgH,imgW]; NumPy/PIL crop preprocessing is not differentiable",
++        torch_num_threads=torch.get_num_threads(),
++        device=str(pipeline.device), inference_dtype=str(next(pipeline.recognizer.parameters()).dtype),
++        saved_tensor_dtype="float16", batch_size=batch_size, batching="equal-width buckets",
++        input_root=os.path.relpath(input_dir, Path.cwd()).replace(os.sep, "/"),
++        image_path_base="parent of input_root", tensor_path_base="output_root",
++        filename_filter=filename, torch_version=str(torch.__version__),
++        cuda_version=torch.version.cuda, cudnn_version=torch.backends.cudnn.version(),
++        validation_policy="old/new, shape, head, probability and cache: every region; repeat and gradient: first region of every nonempty image",
++        tolerances=dict(old_confidence_atol=1e-5, repeat_rtol=1e-5, repeat_atol=1e-6,
++                        fp16_rtol=1e-3, fp16_atol=1e-3))
++
++
++def identity(meta):
++    # Moving a complete dataset/cache/weights to another machine must not depend
++    # on absolute file locations. Device/runtime/code changes still invalidate it.
++    return {k: v for k, v in meta.items()
++            if k not in ("recognition_checkpoint_path", "detector_checkpoint_path", "input_root")}
++
++
++def visualize(image_path, regions, destination):
++    with Image.open(image_path) as source:
++        image = source.convert("RGB")
++    draw = ImageDraw.Draw(image)
++    line_width = max(2, min(image.size) // 600)
++    for region in regions:
++        points = [tuple(p) for p in region["bbox"]]
++        draw.line(points + points[:1], fill=(255, 40, 20), width=line_width)
++        x, y = points[0]
++        label = str(region["region_id"])
++        x, y = max(0, min(x, image.width-20)), max(0, min(y, image.height-15))
++        draw.text((x, y), label, fill=(0, 0, 0), stroke_width=2, stroke_fill=(255, 255, 0))
++    temp = destination.with_name(destination.name + ".tmp")
++    image.save(temp, format="PNG")
++    os.replace(temp, destination)
++
++
++def process_image(pipeline, path, input_dir, output_dir, batch_size):
++    sid = sample_id(path, input_dir)
++    # Read grayscale once. Detector reads RGB from the path using EasyOCR.
++    _, gray = reformat_input(str(path))
++    if gray is None:
++        raise ValueError("Cannot read input image")
++    boxes = pipeline.detect(path)
++    crops = [pipeline.crop(gray, box) for box in boxes]
++    regions = [None] * len(boxes)
++    original = {"features": [None] * len(boxes), "logits": [None] * len(boxes)}
++    checks = [None] * len(boxes)
++    with torch.no_grad():
++        for i, raw, input_size in pipeline.recognize_many(crops, batch_size):
++            decoded = pipeline.decode(raw.logits)
++            checks[i] = validate_region(pipeline, crops[i], raw, decoded)
++            polygon = np.asarray(boxes[i])
++            regions[i] = dict(
++                region_id=i, bbox=boxes[i],
++                xyxy=[float(polygon[:, 0].min()), float(polygon[:, 1].min()),
++                      float(polygon[:, 0].max()), float(polygon[:, 1].max())],
++                text=decoded.text, recognition_confidence=decoded.confidence,
++                detection_confidence=None, feature_index=i, logits_index=i,
++                feature_shape=list(raw.feature.shape[1:]),
++                logits_shape=list(raw.logits.shape[1:]),
++                crop_size=list(crops[i].shape), recognizer_input_size=input_size)
++            original["features"][i] = raw.feature[0].detach().cpu().clone()
++            original["logits"][i] = raw.logits[0].detach().cpu().clone()
++    repeat = validate_repeat(pipeline, crops[0]) if crops else None
++    gradient = validate_input_gradient(pipeline, crops[0]) if crops else None
++    record = dict(sample_id=sid, image_path=input_dir.name + "/" + path.relative_to(input_dir).as_posix(),
++                  image_sha256=sha256_file(path), width=int(gray.shape[1]), height=int(gray.shape[0]),
++                  tensor_path="tensors/" + sid + ".pt",
++                  visualization_path="visualizations/" + sid + "_bbox.png", regions=regions)
++    payload = {key: [t.to(torch.float16) for t in tensors] for key, tensors in original.items()}
++    payload.update(sample_id=sid, region_ids=list(range(len(regions))))
++    target = output_dir / record["tensor_path"]
++    temp = target.with_name(target.name + ".tmp")
++    torch.save(payload, temp)
++    os.replace(temp, target)
++    cache, loaded = validate_cache(record, output_dir, original)
++    # Quantization can move a near-tied argmax. Preserve original-forward text,
++    # and explicitly report whether decoding the stored fp16 logits changed it.
++    cached_text_differences = []
++    for i, logits in enumerate(loaded["logits"]):
++        cached = pipeline.decode(logits.float().unsqueeze(0))
++        if cached.text != regions[i]["text"]:
++            cached_text_differences.append(dict(region_id=i, original=regions[i]["text"],
++                                                cached=cached.text,
++                                                reason="float16 logit rounding changed greedy argmax"))
++    visualize(path, regions, output_dir / record["visualization_path"])
++    record["tensor_sha256"] = sha256_file(target)
++    record["visualization_sha256"] = sha256_file(output_dir / record["visualization_path"])
++    record["validation"] = dict(regions=checks, deterministic=repeat, gradient=gradient,
++                                cache=cache, cached_text_differences=cached_text_differences)
++    record["annotation_sha256"] = record_checksum(record)
++    return record
++
++
++def make_report(paths, records, failures, resumed, output_dir, low_threshold):
++    counts = [len(r["regions"]) for r in records]
++    regions = [region for record in records for region in record["regions"]]
++    confidences = [r["recognition_confidence"] for r in regions]
++    def mean(values):
++        return float(np.mean(values)) if values else None
++    def extrema(values, fn):
++        return fn(values) if values else None
++    checks = [c for r in records for c in r["validation"]["regions"]]
++    repeats = [r["validation"]["deterministic"] for r in records if r["validation"]["deterministic"] is not None]
++    gradients = [r["validation"]["gradient"] for r in records if r["validation"]["gradient"] is not None]
++    finite_counts = dict(feature_nan_count=0, feature_inf_count=0,
++                         logits_nan_count=0, logits_inf_count=0)
++    for record in records:
++        _, payload = validate_cache(record, output_dir)
++        for key, prefix in (("features", "feature"), ("logits", "logits")):
++            for tensor in payload[key]:
++                finite_counts[prefix + "_nan_count"] += int(torch.isnan(tensor).sum())
++                finite_counts[prefix + "_inf_count"] += int(torch.isinf(tensor).sum())
++    result = dict(
++        nonfinite_count_scope="Successfully saved caches; failed images are listed separately",
++        discovered_hr_canonical_images=len(paths), processed_images=len(records),
++        newly_processed_images=len(records)-resumed, resumed_images=resumed,
++        failed_images=len(failures), failures=failures, total_regions=len(regions),
++        avg_regions_per_image=mean(counts), min_regions_per_image=extrema(counts, min),
++        max_regions_per_image=extrema(counts, max),
++        avg_recognition_confidence=mean(confidences),
++        min_recognition_confidence=extrema(confidences, min), max_recognition_confidence=extrema(confidences, max),
++        empty_text_count=sum(not r["text"] for r in regions),
++        low_confidence_threshold=low_threshold,
++        low_confidence_count=sum(c < low_threshold for c in confidences),
++        feature_shape_distribution=dict(Counter(str(r["feature_shape"]) for r in regions)),
++        logits_shape_distribution=dict(Counter(str(r["logits_shape"]) for r in regions)),
++        deterministic_test_passed=all(r["passed"] for r in repeats) if repeats else None,
++        gradient_test_passed=all(r["passed"] for r in gradients) if gradients else None,
++        deterministic_test_count=len(repeats), gradient_test_count=len(gradients),
++        old_new_test_count=len(checks),
++        old_new_test_passed=all(c["old_new_passed"] for c in checks) if checks else None,
++        probability_test_passed=all(c["probability_passed"] for c in checks) if checks else None,
++        shape_test_passed=all(c["shape_passed"] for c in checks) if checks else None,
++        head_test_passed=all(c["head_passed"] for c in checks) if checks else None,
++        cached_tensor_test_passed=all(r["validation"]["cache"]["passed"] for r in records) if records else None,
++        old_new_differences=[dict(sample_id=r["sample_id"], region_id=i, **c)
++                             for r in records for i, c in enumerate(r["validation"]["regions"])
++                             if not c["old_new_passed"]],
++        cached_text_differences=[dict(sample_id=r["sample_id"], **d) for r in records
++                                 for d in r["validation"]["cached_text_differences"]],
++        images=[dict(sample_id=r["sample_id"], image_path=r["image_path"],
++                     region_count=len(r["regions"]), visualization_path=r["visualization_path"])
++                for r in records], **finite_counts)
++    result["all_tests_passed"] = bool(paths and len(records) == len(paths) and not failures
++                                     and all(result[k] is True for k in (
++                                         "deterministic_test_passed", "gradient_test_passed",
++                                         "old_new_test_passed", "probability_test_passed",
++                                         "shape_test_passed", "head_test_passed",
++                                         "cached_tensor_test_passed"))
++                                     and not result["cached_text_differences"])
++    result["status"] = "passed" if result["all_tests_passed"] else "failed_or_not_fully_exercised"
++    return result
++
++
++def build_annotations(pipeline, input_dir="./dataset", output_dir="./ocr_annotations",
++                      filename_filter="hr_canonical.png", batch_size=16,
++                      resume=False, low_confidence_threshold=0.1):
++    input_dir, output_dir = Path(input_dir).resolve(), Path(output_dir).resolve()
++    if output_dir == input_dir or output_dir.is_relative_to(input_dir):
++        raise ValueError("Output must be outside the source dataset")
++    paths = discover_images(input_dir, filename_filter)
++    print("Discovered images: " + str(len(paths)), flush=True)
++    ids = [sample_id(p, input_dir) for p in paths]
++    if len(set(ids)) != len(ids):
++        raise ValueError("sample_id collision")
++    meta = teacher_metadata(pipeline, input_dir, filename_filter, batch_size)
++    if output_dir.exists() and any(output_dir.iterdir()) and not resume:
++        raise FileExistsError("Output is nonempty; use --resume or a new output directory")
++    output_dir.mkdir(parents=True, exist_ok=True)
++    for folder in ("tensors", "visualizations"):
++        (output_dir / folder).mkdir(exist_ok=True)
++    previous = {}
++    meta_path = output_dir / "meta.json"
++    jsonl_path = output_dir / "annotations.jsonl"
++    if resume and meta_path.exists():
++        if identity(json.loads(meta_path.read_text(encoding="utf-8"))) != identity(meta):
++            raise ValueError("Teacher/config/source identity changed; use a new output directory")
++        if jsonl_path.exists():
++            for line in jsonl_path.read_text(encoding="utf-8").splitlines():
++                record = json.loads(line)
++                if record["sample_id"] in previous:
++                    raise ValueError("Duplicate sample_id in annotations.jsonl")
++                previous[record["sample_id"]] = record
++    elif resume and jsonl_path.exists():
++        raise ValueError("Cannot resume annotations without meta.json")
++    atomic_json(meta_path, meta)
++    records, failures, resumed = [], [], 0
++    for position, (path, sid) in enumerate(zip(paths, ids)):
++        try:
++            old = previous.get(sid)
++            if old is not None:
++                try:
++                    if old["annotation_sha256"] != record_checksum(old):
++                        raise ValueError("Annotation checksum changed")
++                    if (old["tensor_path"] != "tensors/" + sid + ".pt"
++                            or old["visualization_path"] != "visualizations/" + sid + "_bbox.png"):
++                        raise ValueError("Unexpected artifact path")
++                    if old["image_sha256"] != sha256_file(path):
++                        raise ValueError("Source image changed")
++                    if old["tensor_sha256"] != sha256_file(output_dir / old["tensor_path"]):
++                        raise ValueError("Tensor checksum changed")
++                    if old["visualization_sha256"] != sha256_file(output_dir / old["visualization_path"]):
++                        raise ValueError("Visualization checksum changed")
++                    validate_cache(old, output_dir)
++                    # A failed validation is regenerated, never counted as completed.
++                    if (any(not all(c[k] for k in ("shape_passed", "probability_passed", "head_passed", "old_new_passed"))
++                            for c in old["validation"]["regions"])
++                            or any(old["validation"][k] is not None and not old["validation"][k]["passed"]
++                                   for k in ("deterministic", "gradient"))
++                            or old["validation"]["cached_text_differences"]):
++                        raise ValueError("Previous acceptance checks failed")
++                except (OSError, ValueError, KeyError, RuntimeError):
++                    old = None
++            record = old if old is not None else process_image(pipeline, path, input_dir, output_dir, batch_size)
++            resumed += int(old is not None)
++            records.append(record)
++            print(sid + ": " + str(len(record["regions"])) + " regions" +
++                  (" (resumed)" if old is not None else ""), flush=True)
++        except Exception as error:
++            failures.append(dict(sample_id=sid, image_path=path.relative_to(input_dir).as_posix(),
++                                 error=type(error).__name__ + ": " + str(error)))
++            print(sid + ": FAILED: " + str(error), flush=True)
++        # Preserve unvisited entries if interrupted during a resumed run.
++        current = {r["sample_id"]: r for r in records}
++        pending = [previous[i] for i in ids[position+1:] if i in previous]
++        write_jsonl(jsonl_path, list(current.values()) + pending)
++    if not paths:
++        write_jsonl(jsonl_path, [])
++    report = make_report(paths, records, failures, resumed, output_dir, low_confidence_threshold)
++    atomic_json(output_dir / "validation_report.json", report)
++    return report
+diff --git a/easyocr/annotation_validation.py b/easyocr/annotation_validation.py
+new file mode 100644
+index 0000000..c88eda9
+--- /dev/null
++++ b/easyocr/annotation_validation.py
+@@ -0,0 +1,102 @@
++"""Runtime acceptance checks; no synthetic success values in reports."""
++import numpy as np
++import torch
++
++from .recognition import get_text
++
++
++def validate_region(pipeline, crop, raw, decoded):
++    f, z = raw.feature, raw.logits
++    if f.ndim != 3 or z.ndim != 3 or f.shape[:2] != z.shape[:2]:
++        raise ValueError("F/Z batch or time axes do not match")
++    if f.shape[-1] != pipeline.recognizer.feature_dim:
++        raise ValueError("F dimension differs from Prediction.in_features")
++    if z.shape[-1] != pipeline.recognizer.num_classes:
++        raise ValueError("Z dimension differs from Prediction.out_features")
++    if not torch.isfinite(f).all() or not torch.isfinite(z).all():
++        raise ValueError("Non-finite forward output")
++    with torch.no_grad():
++        head_ok = torch.allclose(pipeline.recognizer.head(f), z, rtol=1e-5, atol=1e-6)
++        probability_ok = torch.allclose(z.float().softmax(-1).sum(-1),
++                                       torch.ones_like(z[..., 0]), rtol=1e-5, atol=1e-6)
++    resized, width = pipeline.prepare_crop(crop)
++    ignore_char = "".join(pipeline.reader.character[i-1]
++                          for i in pipeline.decoder.ignore_indices)
++    # Original get_text/recognizer_predict and original model default forward.
++    # Identical intermediate crop, width, language mask, no second pass.
++    old = get_text(pipeline.reader.character, pipeline.imgH, width,
++                   pipeline.reader.recognizer, pipeline.reader.converter,
++                   [(None, resized)], ignore_char=ignore_char,
++                   decoder="greedy", batch_size=1, contrast_ths=0.,
++                   adjust_contrast=0., workers=0, device=str(pipeline.device))[0]
++    delta = abs(float(old[2]) - decoded.confidence)
++    return dict(shape_passed=True, probability_passed=bool(probability_ok),
++                head_passed=bool(head_ok), text_old=old[1],
++                confidence_old=float(old[2]), confidence_abs_error=delta,
++                old_new_passed=(old[1] == decoded.text and delta <= 1e-5),
++                difference_reason=(None if old[1] == decoded.text and delta <= 1e-5
++                                   else "Same preprocessing and mask; inspect equal-width batched versus single forward numerical differences."))
++
++
++def validate_input_gradient(pipeline, crop):
++    with torch.enable_grad():
++        fake_sr = pipeline.preprocess(crop).detach().requires_grad_(True)
++        raw = pipeline.recognizer(fake_sr)
++        loss = raw.feature.abs().mean() + raw.logits.abs().mean()
++        loss.backward()
++        grad = fake_sr.grad
++        return dict(passed=bool(grad is not None and torch.isfinite(grad).all()
++                                and grad.abs().sum() > 0
++                                and all(p.grad is None and not p.requires_grad
++                                        for p in pipeline.recognizer.parameters())),
++                    input_grad_abs_sum=float(grad.abs().sum()) if grad is not None else None,
++                    input_shape=list(fake_sr.shape), device=str(fake_sr.device))
++
++
++def validate_repeat(pipeline, crop):
++    with torch.no_grad():
++        first = pipeline.recognize_raw(crop)
++        second = pipeline.recognize_raw(crop)
++    f_ok = torch.allclose(first.feature, second.feature, rtol=1e-5, atol=1e-6)
++    z_ok = torch.allclose(first.logits, second.logits, rtol=1e-5, atol=1e-6)
++    return dict(passed=bool(f_ok and z_ok),
++                feature_max_abs_error=float((first.feature-second.feature).abs().max()),
++                logits_max_abs_error=float((first.logits-second.logits).abs().max()))
++
++
++def validate_cache(record, output_dir, original=None):
++    from pathlib import Path
++    payload = torch.load(Path(output_dir) / record["tensor_path"],
++                         map_location="cpu", weights_only=True)
++    count = len(record["regions"])
++    if payload.get("sample_id") != record["sample_id"]:
++        raise ValueError("Cache sample_id mismatch")
++    if payload.get("region_ids") != list(range(count)):
++        raise ValueError("Cache region IDs mismatch")
++    if len(payload["features"]) != count or len(payload["logits"]) != count:
++        raise ValueError("Cache region count mismatch")
++    max_errors = {"features": 0., "logits": 0.}
++    for i, region in enumerate(record["regions"]):
++        for key, index_key, shape_key in (("features", "feature_index", "feature_shape"),
++                                           ("logits", "logits_index", "logits_shape")):
++            if region[index_key] != i:
++                raise ValueError("Region/tensor index mismatch")
++            tensor = payload[key][i]
++            if (tensor.ndim != 2 or list(tensor.shape) != region[shape_key]
++                    or tensor.dtype != torch.float16 or tensor.requires_grad
++                    or tensor.device.type != "cpu" or not torch.isfinite(tensor).all()):
++                raise ValueError("Invalid cached " + key)
++            if original is not None:
++                source = original[key][i]
++                if not torch.equal(tensor, source.to(torch.float16)):
++                    raise ValueError("Saved tensor differs from pre-save fp16 tensor")
++                error = float((tensor.float() - source.float()).abs().max())
++                max_errors[key] = max(error, max_errors[key])
++                if not torch.allclose(tensor.float(), source.float(), rtol=1e-3, atol=1e-3):
++                    raise ValueError("FP16 roundtrip exceeded tolerance")
++        if payload["features"][i].shape[0] != payload["logits"][i].shape[0]:
++            raise ValueError("Cached F/Z time dimensions mismatch")
++        if not np.isfinite(region["recognition_confidence"]):
++            raise ValueError("Non-finite confidence")
++    return dict(passed=True, max_abs_errors=max_errors), payload
++
+diff --git a/tools/build_ocr_annotations.py b/tools/build_ocr_annotations.py
+new file mode 100644
+index 0000000..dfaa012
+--- /dev/null
++++ b/tools/build_ocr_annotations.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python
++"""Build phase-1 OCR annotations from this checkout, not an installed EasyOCR."""
++import argparse
++import json
++import os
++from pathlib import Path
++import sys
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--input_dir", default="./dataset")
++    parser.add_argument("--output_dir", default="./ocr_annotations")
++    parser.add_argument("--filename_filter", default="hr_canonical.png")
++    parser.add_argument("--languages", nargs="+", default=["ch_sim", "en"])
++    parser.add_argument("--gpu", default="0", help="CUDA index, cuda:N, or cpu; CPU fallback if unavailable")
++    parser.add_argument("--batch_size", type=int, default=16, help="Maximum equal-width crop batch size")
++    parser.add_argument("--model_storage_directory", default="./.ocr_models")
++    parser.add_argument("--download_disabled", action="store_true")
++    parser.add_argument("--save_features", action="store_true", default=True, help="Always enabled in phase 1")
++    parser.add_argument("--save_logits", action="store_true", default=True, help="Always enabled in phase 1")
++    parser.add_argument("--visualize", action="store_true", default=True, help="Always enabled in phase 1")
++    parser.add_argument("--resume", action="store_true")
++    parser.add_argument("--low_confidence_threshold", type=float, default=0.1)
++    parser.add_argument("--text_threshold", type=float, default=0.7)
++    parser.add_argument("--link_threshold", type=float, default=0.4)
++    parser.add_argument("--low_text", type=float, default=0.4)
++    parser.add_argument("--canvas_size", type=int, default=2560)
++    parser.add_argument("--mag_ratio", type=float, default=1.)
++    parser.add_argument("--cpu_threads", type=int, default=4)
++    args = parser.parse_args()
++    if args.batch_size < 1 or args.cpu_threads < 1:
++        parser.error("batch_size and cpu_threads must be positive")
++    if not 0 <= args.low_confidence_threshold <= 1:
++        parser.error("low_confidence_threshold must be in [0,1]")
++    root = Path(args.input_dir).resolve()
++    output = Path(args.output_dir).resolve()
++    if not root.is_dir():
++        parser.error("input_dir must exist")
++    if output == root or output.is_relative_to(root):
++        parser.error("output_dir must be outside input_dir")
++    if (Path(args.filename_filter).name != args.filename_filter
++            or any(c in args.filename_filter for c in "*?[]")):
++        parser.error("filename_filter must be a literal basename")
++    paths = sorted(p for p in root.rglob("*") if p.is_file() and p.name == args.filename_filter)
++    print("Selected " + str(len(paths)) + " files named exactly " + args.filename_filter, flush=True)
++    try:
++        import torch
++        from easyocr.annotation_builder import build_annotations
++        from easyocr.ocr_teacher import OCRPipeline
++        torch.set_num_threads(args.cpu_threads)
++        pipeline = OCRPipeline(
++            languages=args.languages, gpu=args.gpu,
++            model_storage_directory=args.model_storage_directory,
++            download_enabled=not args.download_disabled,
++            text_threshold=args.text_threshold, link_threshold=args.link_threshold,
++            low_text=args.low_text, canvas_size=args.canvas_size, mag_ratio=args.mag_ratio)
++    except Exception as error:
++        # Do not replace a completed run's report with an environment failure.
++        if not (output / "meta.json").exists() and not (output / "annotations.jsonl").exists():
++            output.mkdir(parents=True, exist_ok=True)
++            report = dict(status="blocked_before_inference", all_tests_passed=None,
++                          discovered_hr_canonical_images=len(paths), processed_images=0,
++                          failed_images=0, not_attempted_images=len(paths), total_regions=0,
++                          error=type(error).__name__ + ": " + str(error),
++                          images=[dict(image_path=root.name + "/" + p.relative_to(root).as_posix(),
++                                       region_count=None, status="not_attempted") for p in paths])
++            for key in ("avg_regions_per_image", "min_regions_per_image", "max_regions_per_image",
++                        "avg_recognition_confidence", "min_recognition_confidence", "max_recognition_confidence",
++                        "empty_text_count", "low_confidence_count", "feature_nan_count", "feature_inf_count",
++                        "logits_nan_count", "logits_inf_count", "feature_shape_distribution", "logits_shape_distribution",
++                        "deterministic_test_passed", "gradient_test_passed", "old_new_test_passed",
++                        "probability_test_passed", "shape_test_passed", "cached_tensor_test_passed"):
++                report[key] = None
++            temp = output / "validation_report.json.tmp"
++            temp.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++            os.replace(temp, output / "validation_report.json")
++        print("Teacher initialization failed: " + str(error), file=sys.stderr)
++        return 2
++    report = build_annotations(
++        pipeline, args.input_dir, args.output_dir, args.filename_filter,
++        args.batch_size, args.resume, args.low_confidence_threshold)
++    print("Processed: {processed_images}; failed: {failed_images}; regions: {total_regions}; status: {status}".format(**report),
++          flush=True)
++    return 0 if report["all_tests_passed"] else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_ocr_teacher.py b/tests/test_ocr_teacher.py
+new file mode 100644
+index 0000000..de3b0a8
+--- /dev/null
++++ b/tests/test_ocr_teacher.py
+@@ -0,0 +1,177 @@
++"""Offline contract tests. Official-weight/data acceptance runs via the CLI."""
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++from PIL import Image
++import pytest
++import torch
++
++from easyocr import annotation_builder as builder
++from easyocr.annotation_validation import validate_input_gradient, validate_region, validate_repeat
++from easyocr.model.model import Model as Generation1
++from easyocr.model.vgg_model import Model as Generation2
++from easyocr.ocr_teacher import (CTCDecoder, OCRPipeline, OCRRecognizer,
++                                 TextDetector, configure_determinism)
++from easyocr.utils import CTCLabelConverter
++
++
++@pytest.fixture(autouse=True)
++def deterministic():
++    torch.set_num_threads(2)
++    torch.manual_seed(7)
++    configure_determinism()
++
++
++@pytest.fixture
++def pipeline():
++    model = Generation2(input_channel=1, output_channel=32, hidden_size=8, num_class=3)
++    result = OCRPipeline.__new__(OCRPipeline)
++    result.recognizer = OCRRecognizer(model)
++    converter = CTCLabelConverter("ab")
++    result.reader = SimpleNamespace(character="ab", recognizer=model, converter=converter)
++    result.decoder = CTCDecoder(converter, [])
++    result.imgH = 64
++    return result
++
++
++@pytest.mark.parametrize("model_class", [Generation1, Generation2])
++def test_real_feature_boundary_and_backward_compatibility(model_class):
++    model = model_class(input_channel=1, output_channel=32, hidden_size=8, num_class=4).eval()
++    state_keys = set(model.state_dict())
++    x = torch.randn(2, 1, 64, 64)
++    with torch.no_grad():
++        visual = model.FeatureExtraction(x)
++        visual = model.AdaptiveAvgPool(visual.permute(0, 3, 1, 2)).squeeze(3)
++        expected_f = model.SequenceModeling(visual)
++        expected_z = model.Prediction(expected_f.contiguous())
++        f, z = model(x, None, return_features=True)
++        assert torch.equal(f, expected_f)
++        assert torch.equal(z, expected_z)
++        assert torch.equal(model(x, torch.zeros(2, 5, dtype=torch.long)), expected_z)
++    assert state_keys == set(model.state_dict())
++    teacher = OCRRecognizer(model)
++    x.requires_grad_(True)
++    raw = teacher(x)
++    (raw.feature.abs().mean() + raw.logits.abs().mean()).backward()
++    assert x.grad is not None and torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0
++    assert all(p.grad is None and not p.requires_grad for p in model.parameters())
++
++
++def test_ctc_blank_repeats_and_language_mask():
++    converter = CTCLabelConverter("ab")
++    decoder = CTCDecoder(converter, [])
++    # a,a,blank,a,b,b -> aab (blank separates repeated a).
++    logits = torch.full((1, 6, 3), -8.)
++    for t, index in enumerate([1, 1, 0, 1, 2, 2]):
++        logits[0, t, index] = 8
++    decoded = decoder(logits)[0]
++    assert decoded.text == "aab"
++    assert 0.99 < decoded.confidence <= 1
++    blank = decoder(torch.tensor([[[20., 0., 0.]]]))[0]
++    assert blank.text == "" and blank.confidence == 0
++    masked = CTCDecoder(converter, [2])(torch.tensor([[[0., 5., 10.]]]))[0]
++    assert masked.text == "a"
++
++
++def test_preprocessing_original_consistency_and_repeat(pipeline):
++    crop = np.random.default_rng(7).integers(0, 255, (30, 90), dtype=np.uint8)
++    with torch.no_grad():
++        raw = pipeline.recognize_raw(crop)
++        decoded = pipeline.decode(raw.logits)
++        checks = validate_region(pipeline, crop, raw, decoded)
++    assert all(checks[k] for k in ("shape_passed", "head_passed", "probability_passed", "old_new_passed"))
++    assert validate_repeat(pipeline, crop)["passed"]
++    assert validate_input_gradient(pipeline, crop)["passed"]
++
++
++def test_equal_width_batch_is_independent_of_other_crop_widths(pipeline):
++    crops = [np.full((30, 90), 80, np.uint8), np.full((30, 90), 180, np.uint8),
++             np.full((30, 170), 100, np.uint8), np.full((90, 30), 110, np.uint8)]
++    with torch.no_grad():
++        outputs = {i: raw for i, raw, _ in pipeline.recognize_many(crops, batch_size=2)}
++        for i, crop in enumerate(crops):
++            single = pipeline.recognize_raw(crop)
++            assert outputs[i].feature.shape == single.feature.shape
++            assert torch.allclose(outputs[i].feature, single.feature, atol=1e-6, rtol=1e-5)
++            assert torch.allclose(outputs[i].logits, single.logits, atol=1e-6, rtol=1e-5)
++
++
++def test_craft_polygon_preserved(monkeypatch):
++    import easyocr.ocr_teacher as module
++    polygon = np.array([[10.5, 5], [80, 15], [77, 38], [8, 28]], np.float32)
++    monkeypatch.setattr(module, "test_net", lambda **kwargs: ([[polygon]], [[polygon]]))
++    reader = SimpleNamespace(detector=object(), device="cpu")
++    boxes = TextDetector(reader)(np.zeros((100, 100, 3), np.uint8))
++    assert boxes == [polygon.tolist()]
++
++
++def test_filename_filter_and_ids(tmp_path):
++    for name in ("a/b/hr_canonical.png", "a__b/hr_canonical.png", "hr_canonical.png",
++                 "other/HR_CANONICAL.PNG", "a/b/lr.png", "a/b/hr.png"):
++        path = tmp_path / name
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.touch()
++    paths = builder.discover_images(tmp_path)
++    assert len(paths) == 3 and all(p.name == "hr_canonical.png" for p in paths)
++    ids = [builder.sample_id(p, tmp_path) for p in paths]
++    assert len(set(ids)) == 3
++    assert ids == [builder.sample_id(Path("/relocated") / p.relative_to(tmp_path), Path("/relocated"))
++                   for p in paths]
++
++
++def test_builder_cache_resume_corruption_and_empty_image(tmp_path, pipeline, monkeypatch):
++    dataset, output = tmp_path / "dataset", tmp_path / "annotations"
++    (dataset / "a").mkdir(parents=True)
++    (dataset / "b").mkdir()
++    img = np.random.default_rng(7).integers(0, 255, (64, 192), dtype=np.uint8)
++    Image.fromarray(img).save(dataset / "a" / "hr_canonical.png")
++    Image.fromarray(img).save(dataset / "b" / "hr_canonical.png")
++    Image.fromarray(img).save(dataset / "a" / "lr.png")
++    calls = []
++    def detect(path):
++        calls.append(path)
++        return [] if path.parent.name == "b" else [[[1, 1], [90, 1], [90, 31], [1, 31]],
++                                                   [[95, 5], [180, 5], [180, 40], [95, 40]]]
++    pipeline.detect = detect
++    monkeypatch.setattr(builder, "teacher_metadata", lambda *args: {"test_teacher": 1})
++    report = builder.build_annotations(pipeline, dataset, output, batch_size=2)
++    assert report["all_tests_passed"]
++    assert report["processed_images"] == 2 and report["total_regions"] == 2
++    records = [json.loads(line) for line in (output / "annotations.jsonl").read_text().splitlines()]
++    assert [len(r["regions"]) for r in records] == [2, 0]
++    with pytest.raises(FileExistsError):
++        builder.build_annotations(pipeline, dataset, output)
++    calls.clear()
++    resumed = builder.build_annotations(pipeline, dataset, output, batch_size=2, resume=True)
++    assert resumed["resumed_images"] == 2 and not calls
++    target = output / records[0]["tensor_path"]
++    payload = torch.load(target, weights_only=True)
++    payload["features"][0][0, 0] += 1
++    torch.save(payload, target)
++    resumed = builder.build_annotations(pipeline, dataset, output, batch_size=2, resume=True)
++    assert resumed["resumed_images"] == 1 and len(calls) == 1
++    assert resumed["all_tests_passed"]
++    calls.clear()
++    records = [json.loads(line) for line in (output / "annotations.jsonl").read_text().splitlines()]
++    records[0]["regions"][0]["text"] = "corrupted annotation"
++    builder.write_jsonl(output / "annotations.jsonl", records)
++    repaired = builder.build_annotations(pipeline, dataset, output, batch_size=2, resume=True)
++    assert repaired["resumed_images"] == 1 and len(calls) == 1
++    assert repaired["all_tests_passed"]
++    monkeypatch.setattr(builder, "teacher_metadata", lambda *args: {"test_teacher": 2})
++    with pytest.raises(ValueError, match="identity"):
++        builder.build_annotations(pipeline, dataset, output, resume=True)
++
++
++def test_all_empty_is_not_a_false_validation_pass(tmp_path, pipeline, monkeypatch):
++    dataset = tmp_path / "dataset"
++    dataset.mkdir()
++    Image.new("L", (64, 64)).save(dataset / "hr_canonical.png")
++    pipeline.detect = lambda path: []
++    monkeypatch.setattr(builder, "teacher_metadata", lambda *args: {"test_teacher": 1})
++    report = builder.build_annotations(pipeline, dataset, tmp_path / "annotations")
++    assert report["processed_images"] == 1
++    assert report["gradient_test_passed"] is None
++    assert not report["all_tests_passed"]
+diff --git a/docs/ocr_teacher.md b/docs/ocr_teacher.md
+new file mode 100644
+index 0000000..c8d8526
+--- /dev/null
++++ b/docs/ocr_teacher.md
+@@ -0,0 +1,179 @@
++# OCR teacher and offline annotations (phase 1)
++
++This checkout supports an isolated CRAFT + official zh_sim_g2 teacher. VOSR is
++not involved. The dataset is read-only; the default filename match is the exact,
++case-sensitive basename `hr_canonical.png`, recursively beneath `./dataset`.
++
++## Verified source map
++
++- Detection: `easyocr/easyocr.py: Reader.readtext -> Reader.detect`, then
++  `easyocr/detection.py: get_textbox -> test_net`, calling
++  `easyocr/craft.py: CRAFT.forward` and `craft_utils.getDetBoxes`.
++- Recognition: `Reader.recognize -> utils.get_image_list -> recognition.get_text
++  -> AlignCollate/NormalizePAD -> recognizer_predict -> Model.forward`.
++- Generation 1: `easyocr/model/model.py: Model` uses
++  `modules.ResNet_FeatureExtractor`, two `modules.BidirectionalLSTM` blocks,
++  then `Prediction: nn.Linear`. Standard hidden dimension is 512.
++- Generation 2: `easyocr/model/vgg_model.py: Model` uses
++  `modules.VGG_FeatureExtractor`, two `modules.BidirectionalLSTM` blocks,
++  then `Prediction: nn.Linear`. Standard hidden dimension is 256.
++  `Reader(["ch_sim", "en"])` selects `zh_sim_g2` in the checked-out config.
++- CTC: `utils.CTCLabelConverter.decode_greedy`.
++- Confidence: `recognition.recognizer_predict` selects nonblank time-step
++  probabilities and calls `recognition.custom_mean`. This includes repeated
++  nonblank steps, not just collapsed characters.
++- Adaptive contrast: `recognition.get_text` runs a second loader/forward for
++  low-confidence crops and selects the higher score. Annotation bypasses this.
++- The new optional `Model.forward(..., return_features=True)` returns the real
++  `SequenceModeling` output and its classifier logits. The default signature
++  remains logits-only. State dict names and weights do not change.
++
++`BidirectionalLSTM.forward` itself includes a linear projection after the
++bidirectional RNN. F means the final, projected `SequenceModeling` output that
++is actually passed to `Prediction`, not an unprojected hidden state.
++D and C are read from the loaded `Prediction.in_features/out_features`.
++
++## Server commands
++
++Use your server's compatible PyTorch/torchvision installation (CUDA if desired),
++then install this checkout's remaining requirements. Python 3.9 or newer is
++required for this annotation interface. From the repository root:
++
++```bash
++python -m pip install -r requirements.txt pytest
++python -m pytest tests/test_ocr_teacher.py -q
++python tools/build_ocr_annotations.py \
++  --input_dir ./dataset \
++  --output_dir ./ocr_annotations \
++  --filename_filter hr_canonical.png \
++  --languages ch_sim en \
++  --gpu 0 --batch_size 16 \
++  --save_features --save_logits --visualize --resume
++```
++
++`--gpu cpu` forces CPU. If CUDA is unavailable the teacher falls back to CPU.
++Official weights are downloaded into `./.ocr_models`; use
++`--model_storage_directory /path/to/models --download_disabled` for offline
++servers with weights already present. Quantization is disabled on every device.
++The CLI prints one region count per image and exits nonzero on failed or
++unexercised required acceptance checks. Features, logits and visualization are
++mandatory in phase 1; their CLI flags are accepted for clarity and default on.
++
++The initial non-resume run refuses a nonempty output directory. Resume compares
++teacher source/weights/runtime/config identity, original-image hashes, tensor
++and visualization hashes, per-record annotation checksums, and tensor structure. Damaged or outdated sample
++artifacts are regenerated. Teacher identity changes require a fresh output
++directory. Do not run two builders concurrently against the same output directory.
++
++## Python API
++
++```python
++from pathlib import Path
++import torch
++from easyocr.ocr_teacher import OCRPipeline
++
++pipeline = OCRPipeline(languages=["ch_sim", "en"], gpu=True)
++image = Path("dataset/example/hr_canonical.png")
++boxes = pipeline.detect(image)
++for box in boxes:
++    crop = pipeline.crop(image, box)       # uint8 grayscale, rectified
++    with torch.no_grad():                # caller owns offline no_grad policy
++        raw = pipeline.recognize_raw(crop)
++    print(raw.feature.shape)             # [1, T, D]
++    print(raw.logits.shape)              # [1, T, C], raw and unmasked
++    decoded = pipeline.decode(raw.logits)
++    print(decoded.text, decoded.confidence)
++```
++
++The four components are `TextDetector`, `RecognitionEncoder`,
++`CharacterPredictionHead`, and `CTCDecoder`. `OCRRecognizer` composes encoder
++and head. `decode_batch` returns one decoded dataclass per batch row.
++`recognize_many(crops, batch_size)` yields
++`(original_region_index, OCRForwardOutput, [imgH, imgW])`. It groups only
++equal-width crops, so padding/T does not depend on neighboring crop widths.
++
++For the future frozen-teacher gradient path:
++
++```python
++fake_sr = pipeline.preprocess(crop).detach().requires_grad_(True)
++raw = pipeline.recognizer(fake_sr)
++loss = raw.feature.abs().mean() + raw.logits.abs().mean()
++loss.backward()
++assert fake_sr.grad is not None
++assert all(p.grad is None for p in pipeline.recognizer.parameters())
++```
++
++The recognizer accepts normalized `[B,1,H,W]` floating tensors and preserves
++their graph. NumPy/OpenCV/PIL crop preprocessing is an offline operation and is
++not differentiable. A later VOSR integration must implement corresponding
++differentiable image crop/resize operations and verify their numerical match;
++the current test proves gradients through the OCR model, not through a full
++SR-image-to-PIL pipeline. On CUDA, input-gradient forwards use native LSTM:
++cuDNN's eval-mode RNN forward does not support backward. Annotation forwards
++use the normal deterministic inference backend. CPU/CUDA numerical parity is
++not claimed; device/runtime identity is recorded.
++
++## Coordinates, preprocessing and decoding
++
++The detector returns CRAFT's original four points, ordered TL/TR/BR/BL, in
++original-image pixels. It deliberately does not apply `group_text_box`, a
++horizontal-line merge, or an added margin. This differs from default full-image
++`readtext()` boxes, while preserving the requested canonical CRAFT geometry.
++Coordinates are not normalized or silently clamped. Cropping uses the saved
++polygon with `utils.four_point_transform` (OpenCV perspective warp and zero
++border). Region IDs follow a stable top-to-bottom, then left-to-right ordering.
++
++After rectification the pipeline reuses `compute_ratio_and_resize` and then
++`AlignCollate`: grayscale, configured imgH=64, PIL bicubic resizing, [-1,1]
++normalization, and right-edge padding. Width is
++`ceil(max(w/h, h/w, 1))*imgH` for that crop alone. This also preserves the
++repository's existing handling of tall crops rather than silently changing it.
++Both pre-resize crop size and actual OCR input size are recorded per region.
++
++Saved Z is the original raw classifier output, including CTC blank at class 0.
++Only the decoder applies the Reader's language character mask and renormalizes
++probabilities, exactly as the original recognizer does. P=softmax(Z) is a
++separate, unmasked distribution for future distillation. There is no adaptive
++contrast, rotation selection, or confidence-based second pass in annotation.
++
++Confidence and text come from the same inference-dtype Z as F. Converting Z to
++float16 can change a nearly tied argmax; validation explicitly reports any
++difference when decoding the saved cache and fails acceptance in that case.
++It never silently relabels the original result.
++
++## Artifacts and validation
++
++`annotations.jsonl` contains one record per successfully processed image,
++including images with zero regions. Every region indexes the corresponding
++entry in `tensors/<sample_id>.pt`. The payload contains lists `features`
++(`[T,D]`) and `logits` (`[T,C]`), detached on CPU in float16, plus sample
++and region IDs. JSON tensor paths are relative to the output root; image paths
++are relative to the parent of the input root. IDs include a readable relative
++parent path plus a deterministic hash, avoiding collisions between nested names.
++
++`meta.json` records checkpoint paths and SHA256, source hashes and commit,
++charset and hash, all preprocessing/decoder/detector settings, dimensions,
++runtime/device/dtypes and validation tolerances. `visualizations/*_bbox.png`
++shows boxes and region IDs on the full-resolution original.
++
++`validation_report.json` contains input/success/failure counts, per-image
++region counts, confidence statistics, empty/low-confidence counts, tensor
++shape distributions, successful-cache NaN/Inf counts, old/new differences,
++and acceptance flags. Failed images include an error rather than fabricated
++regions; their invalid tensors are not counted as successful caches.
++An all-empty dataset produces null (unexercised), not true, for forward tests.
++
++- Every region: F/Z dimensions, finite values, Z=Prediction(F), probability
++  normalization, and original `get_text` consistency with identical crop,
++  width and language mask, contrast_ths=0 and adjust_contrast=0.
++- First region of every nonempty image: repeated forward allclose and frozen
++  teacher/input-gradient backward.
++- Every saved region: safe tensor-only reload, matching IDs/indices/shapes,
++  exact equality after fp16 conversion and fp32 comparison at rtol/atol=1e-3.
++- Unit tests also exercise both generations, CTC blank/repeats/masking,
++  batch-composition invariance, filtering, ID collisions, empty detections,
++  resume, and corruption recovery.
++
++Original `readtext()` with its default merging, shared batch padding or
++contrast retry is not the parity reference. Any observed old/new differences
++under matched conditions are listed with region IDs in the runtime report.
