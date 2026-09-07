@@ -1,0 +1,103 @@
+{
+  "degradation_params": {
+    "backend": "blender_scene_3d",
+    "scene": "outdoor_table",
+    "lighting": "single_point",
+    "render_backend": {
+      "engine": "CYCLES",
+      "device": "CPU",
+      "cycles_samples": 2
+    },
+    "capture_quality": {
+      "original": {
+        "jpeg_quality": 98,
+        "cycles_samples": 8
+      },
+      "degrade": {
+        "jpeg_quality": 82,
+        "cycles_samples": 2
+      }
+    },
+    "capture_pair": {
+      "original": "lr_phone_original.jpg",
+      "degrade": "lr_phone_degrade.jpg",
+      "shared_scene_parameters": true
+    },
+    "sharding": {
+      "shard_index": 0,
+      "shard_count": 1,
+      "global_sample_index": 2
+    },
+    "lighting_energy": {
+      "scene_energy_scale": 0.4868,
+      "fixture_energy_values": [
+        121.01
+      ],
+      "fixture_positions_m": [
+        [
+          0.15,
+          -1.435,
+          2.008
+        ]
+      ],
+      "energy_scale_range": [
+        0.33,
+        0.57
+      ],
+      "fixture_jitter_range": [
+        0.9,
+        1.1
+      ],
+      "azimuth_jitter_degrees": 85,
+      "radius_scale_range": [
+        0.72,
+        1.2
+      ],
+      "height_jitter_m": [
+        -0.3,
+        0.35
+      ]
+    },
+    "color_management": {
+      "configured": false,
+      "view_transform": "AgX",
+      "exposure_ev": 0.0
+    },
+    "document_material": {
+      "roughness": 0.9243,
+      "specular_ior_level": 0.2234,
+      "roughness_range": [
+        0.82,
+        0.95
+      ],
+      "specular_ior_level_range": [
+        0.15,
+        0.35
+      ],
+      "specular_control_applied": true
+    },
+    "paper_curl_height_m": 0,
+    "camera_tilt_degrees": 11.753847411215204,
+    "homography_canonical_to_phone": [
+      [
+        -0.6498316862476216,
+        0.10237458002644144,
+        1264.9313889741898
+      ],
+      [
+        -0.045082259227732284,
+        -0.5773346434641058,
+        1850.7078272402287
+      ],
+      [
+        4.913330357931137e-06,
+        6.292156187117173e-05,
+        1
+      ]
+    ],
+    "rectification_target_size": [
+      1600,
+      2200
+    ]
+  }
+}

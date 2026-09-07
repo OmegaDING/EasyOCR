@@ -1,0 +1,34 @@
+{
+  "paired_capture": true,
+  "captures": [
+    {
+      "input": "lr_phone_original.jpg",
+      "output": "lr_rectified_original.png",
+      "method": "known_synthetic_homography",
+      "resampling": "perspective_only",
+      "interpolation": "linear",
+      "additional_downsampling": false,
+      "output_size": [
+        1600,
+        2200
+      ]
+    },
+    {
+      "input": "lr_phone_degrade.jpg",
+      "output": "lr_rectified_degrade.png",
+      "method": "known_synthetic_homography",
+      "resampling": "perspective_only",
+      "interpolation": "cubic",
+      "additional_downsampling": false,
+      "output_size": [
+        1600,
+        2200
+      ]
+    }
+  ],
+  "sharding": {
+    "shard_index": 0,
+    "shard_count": 1,
+    "global_sample_index": 1
+  }
+}
