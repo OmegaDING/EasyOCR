@@ -196,6 +196,25 @@ def identity(meta):
                          "input_root", "sample_range", "validation_samples")}
 
 
+def identity_difference_keys(previous, current):
+    """Return compact, actionable names for a resume-identity mismatch."""
+    differences = []
+    for key in sorted(set(previous) | set(current)):
+        if previous.get(key) == current.get(key):
+            continue
+        if key in ("library_versions", "source_sha256", "detector_thresholds",
+                   "tolerances"):
+            nested_previous = previous.get(key, {})
+            nested_current = current.get(key, {})
+            nested = sorted(set(nested_previous) | set(nested_current))
+            changed = [name for name in nested
+                       if nested_previous.get(name) != nested_current.get(name)]
+            differences.extend(key + "." + name for name in changed)
+        else:
+            differences.append(key)
+    return differences
+
+
 def visualize(image_path, regions, destination):
     with Image.open(image_path) as source:
         image = source.convert("RGB")
@@ -510,7 +529,9 @@ def build_mirrored_annotations(pipeline, input_dir="./dataset", output_dir="./oc
     if resume and meta_path.exists():
         old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if identity(old_meta) != identity(meta):
-            raise ValueError("Teacher/config/source identity changed; use a new output directory")
+            changed = identity_difference_keys(identity(old_meta), identity(meta))
+            raise ValueError("Teacher/config/source identity changed ("
+                             + ", ".join(changed) + "); use a new output directory")
     elif resume and any(output_dir.iterdir()):
         raise ValueError("Cannot resume sample artifacts without meta.json")
     atomic_json(meta_path, meta)
